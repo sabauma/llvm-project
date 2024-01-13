@@ -1,4 +1,5 @@
 // RUN: mlir-opt --split-input-file --tosa-infer-shapes %s | FileCheck %s
+// RUN: mlir-opt --split-input-file --tosa-infer-shapes="aggressive-mode=1" %s | FileCheck %s --check-prefix=CHECK-AGGRESSIVE
 
 // CHECK-LABEL: @test_return
 func.func @test_return(%arg0 : tensor<4xf32>) -> tensor<*xf32> {
@@ -1258,6 +1259,20 @@ func.func @test_non_tosa_consumer_extract(%arg0: tensor<4x4xf32>, %arg1: index) 
   %0 = tosa.log %arg0 : (tensor<4x4xf32>) -> tensor<?x?xf32>
   %1 = tensor.extract %0[%arg1, %arg1] : tensor<?x?xf32>
   return %1 : f32
+}
+
+// -----
+
+// CHECK-LABEL: tosa_insert_slice
+func.func @tosa_insert_slice(%arg0: tensor<4x4xf32>, %arg1: tensor<?x?xf32>, %arg2: index) -> tensor<?x?xf32> {
+  // CHECK: %[[LOG:.+]] = tosa.log %arg0 : (tensor<4x4xf32>) -> tensor<4x4xf32>
+  // CHECK: tensor.cast %[[LOG]] : tensor<4x4xf32> to tensor<?x?xf32>
+
+  // CHECK-AGGRESSIVE: %[[LOG:.+]] = tosa.log %arg0 : (tensor<4x4xf32>) -> tensor<4x4xf32>
+  // CHECK-AGGRESSIVE: tensor.insert_slice %arg1 into %[[LOG]][0, 0] [%arg2, %arg2] [%arg2, %arg2] : tensor<?x?xf32> into tensor<4x4xf32>
+  %0 = tosa.log %arg0 : (tensor<4x4xf32>) -> tensor<?x?xf32>
+  %1 = tensor.insert_slice %arg1 into %0[0, 0][%arg2, %arg2][%arg2, %arg2] : tensor<?x?xf32> into tensor<?x?xf32>
+  return %1 : tensor<?x?xf32>
 }
 
 // -----

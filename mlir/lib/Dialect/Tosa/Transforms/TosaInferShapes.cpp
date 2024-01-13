@@ -18,14 +18,9 @@
 #include "mlir/Dialect/Tosa/IR/TosaOps.h"
 #include "mlir/Dialect/Tosa/Utils/ShapeUtils.h"
 #include "mlir/IR/Builders.h"
-#include "mlir/IR/BuiltinOps.h"
-#include "mlir/IR/IRMapping.h"
-#include "mlir/IR/Matchers.h"
 #include "mlir/Interfaces/InferTypeOpInterface.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/DialectConversion.h"
-#include "mlir/Transforms/GreedyPatternRewriteDriver.h"
-#include "llvm/Support/FormatVariadic.h"
 
 namespace mlir {
 namespace tosa {
@@ -39,9 +34,59 @@ using namespace mlir::tosa;
 
 namespace {
 
-void propagateShapesInRegion(Region &region);
+// Check whether this use case is inferable (i.e. its type may be updated by
+// shape propagation). We define an op as being inferable if it is used by a
+// TosaOp, or an op with a type-inference related interface. When a
+// non-replaceable use is encountered, the value is wrapped in a cast back to
+// the original type after inference.
+//
+bool isInferableOperation(Operation *user, bool aggressiveMode) {
+  return user->getDialect()->getNamespace() == TosaDialect::getDialectNamespace() ||
+         isa<InferShapedTypeOpInterface>(user) ||
+         (aggressiveMode && isa<InferTypeOpInterface>(user));
+}
 
-void propagateShapesToTosaIf(Operation &op) {
+struct TypeRewriteState {
+  void recordUpdate(Value value, Type oldType) {
+    for (auto &user : value.getUses()) {
+      if (!isInferableOperation(user.getOwner(), aggressiveMode))
+        replacedUses.push_back({&user, oldType});
+    }
+  }
+
+  void applyUpdates(RewriterBase& rewriter) {
+    for (auto [operand, oldType] : replacedUses) {
+      rewriter.setInsertionPoint(operand->getOwner());
+
+      auto oldValue = operand->get();
+
+      auto loc = oldValue.getLoc();
+      auto castOp = rewriter.create<tensor::CastOp>(loc, oldType, oldValue);
+      operand->set(castOp);
+    }
+  }
+
+  bool aggressiveMode;
+
+  using Entry = std::pair<OpOperand*, Type>;
+  llvm::SmallVector<Entry> replacedUses = {};
+};
+
+struct ShapePropagation {
+  void propagateShapesToTosaIf(Operation &op);
+  void propagateShapesToTosaWhile(Operation &op);
+  void propagateShapesInterface(InferShapedTypeOpInterface shapeInterface,
+                                TypeRewriteState &requiresUpdate);
+
+  void propagateShapesInterface(InferTypeOpInterface shapeInterface,
+                                TypeRewriteState &requiresUpdate);
+
+  void propagateShapesInRegion(Region &region);
+
+  bool aggressiveMode{false};
+};
+
+void ShapePropagation::propagateShapesToTosaIf(Operation &op) {
   IfOp ifOp = dyn_cast<IfOp>(op);
   if (!ifOp)
     return;
@@ -78,7 +123,7 @@ void propagateShapesToTosaIf(Operation &op) {
   }
 }
 
-void propagateShapesToTosaWhile(Operation &op) {
+void ShapePropagation::propagateShapesToTosaWhile(Operation &op) {
   WhileOp whileOp = dyn_cast<WhileOp>(op);
   if (!whileOp)
     return;
@@ -183,99 +228,106 @@ void propagateShapesToTosaWhile(Operation &op) {
   }
 }
 
-// Track the old type for each operand whose type was updated
-// during inference. This information is used to introduce casts
-// back to the type expected by the operand after inference.
-struct TypeRewriteInfo {
-  OpOperand *operand;
-  Type oldType;
-};
+void ShapePropagation::propagateShapesInterface(InferShapedTypeOpInterface shapeInterface,
+                                                TypeRewriteState &requiresUpdate) {
+  Operation &op = *shapeInterface.getOperation();
 
-void propagateShapesInRegion(Region &region) {
-  // Check whether this use case is replaceable. We define an op as
-  // being replaceable if it is used by a TosaOp, or an op with a
-  // type-inference related interface.
-  // When a non-replaceable use is encountered, the value is wrapped in a
-  // cast back to the original type after inference.
-  auto isReplaceableUser = [](Operation *user) -> bool {
-    return user->getDialect()->getNamespace() ==
-               TosaDialect::getDialectNamespace() ||
-           isa<InferTypeOpInterface, InferShapedTypeOpInterface>(user);
-  };
+  SmallVector<ShapedTypeComponents> returnedShapes;
+  if (shapeInterface
+          .inferReturnTypeComponents(
+              op.getContext(), op.getLoc(), op.getOperands(),
+              op.getDiscardableAttrDictionary(), op.getPropertiesStorage(),
+              op.getRegions(), returnedShapes)
+          .failed())
+    return;
 
-  llvm::SmallVector<TypeRewriteInfo> requiresUpdate;
+  for (auto it : llvm::zip(op.getResults(), returnedShapes)) {
+    Value result = std::get<0>(it);
+    ShapedTypeComponents predictedShape = std::get<1>(it);
+
+    // Determine the knowledge based on the output type.
+    // TODO: should also query WIP type probably
+    Type resultTy = result.getType();
+    auto currentKnowledge = ValueKnowledge::getKnowledgeFromType(resultTy);
+
+    // Compute the knowledge based on the inferred type.
+    auto inferredKnowledge =
+        ValueKnowledge(predictedShape.hasRank(),
+                       predictedShape.hasRank() ? predictedShape.getDims()
+                                                : ArrayRef<int64_t>{},
+                       cast<ShapedType>(resultTy).getElementType());
+
+    // Compute the new type based on the joined version.
+    auto newKnowledge =
+        ValueKnowledge::join(currentKnowledge, inferredKnowledge);
+    if (!newKnowledge)
+      continue;
+
+    // Set new type
+    result.setType(newKnowledge.getType());
+
+    // Collect all uses of the operation which require update.
+    requiresUpdate.recordUpdate(result, resultTy);
+  }
+}
+
+void ShapePropagation::propagateShapesInterface(InferTypeOpInterface shapeInterface,
+                                                TypeRewriteState &requiresUpdate) {
+  Operation &op = *shapeInterface.getOperation();
+
+  llvm::SmallVector<Type> returnedTypes;
+
+  if (failed(shapeInterface.inferReturnTypes(
+          op.getContext(), op.getLoc(), op.getOperands(),
+          op.getDiscardableAttrDictionary(), op.getPropertiesStorage(),
+          op.getRegions(), returnedTypes))) {
+    return;
+  }
+
+  for (auto [result, predicted] : llvm::zip(op.getResults(), returnedTypes)) {
+    auto resultTy = result.getType();
+
+    if (resultTy == predicted || !isa<ShapedType>(result.getType()) ||
+        !isa<ShapedType>(predicted))
+      continue;
+
+    // Compute the new type.
+    auto newKnowledge =
+        ValueKnowledge::join(ValueKnowledge::getKnowledgeFromType(predicted),
+                             ValueKnowledge::getKnowledgeFromType(resultTy));
+    if (!newKnowledge)
+      continue;
+
+    result.setType(newKnowledge.getType());
+
+    requiresUpdate.recordUpdate(result, resultTy);
+  }
+}
+
+
+void ShapePropagation::propagateShapesInRegion(Region &region) {
+
+  TypeRewriteState requiresUpdate{aggressiveMode};
   for (auto &block : region) {
     for (Operation &op : block) {
-      if (op.getDialect()->getNamespace() != TosaDialect::getDialectNamespace())
+      if (!isInferableOperation(&op, aggressiveMode))
         continue;
 
       propagateShapesToTosaIf(op);
       propagateShapesToTosaWhile(op);
 
-      InferShapedTypeOpInterface shapeInterface =
-          dyn_cast<InferShapedTypeOpInterface>(op);
-      if (!shapeInterface)
-        continue;
+      if (auto shapeInterface = dyn_cast<InferShapedTypeOpInterface>(op))
+        propagateShapesInterface(shapeInterface, requiresUpdate);
 
-      SmallVector<ShapedTypeComponents> returnedShapes;
-
-      if (shapeInterface
-              .inferReturnTypeComponents(
-                  op.getContext(), op.getLoc(), op.getOperands(),
-                  op.getDiscardableAttrDictionary(), op.getPropertiesStorage(),
-                  op.getRegions(), returnedShapes)
-              .succeeded()) {
-        for (auto it : llvm::zip(op.getResults(), returnedShapes)) {
-          Value result = std::get<0>(it);
-          ShapedTypeComponents predictedShape = std::get<1>(it);
-
-          // Determine the knowledge based on the output type.
-          // TODO: should also query WIP type probably
-          Type resultTy = result.getType();
-          auto currentKnowledge =
-              ValueKnowledge::getKnowledgeFromType(resultTy);
-
-          // Compute the knowledge based on the inferred type.
-          auto inferredKnowledge = ValueKnowledge::getPessimisticValueState();
-          inferredKnowledge.dtype = cast<ShapedType>(resultTy).getElementType();
-          inferredKnowledge.hasRank = predictedShape.hasRank();
-          if (predictedShape.hasRank()) {
-            for (auto dim : predictedShape.getDims()) {
-              inferredKnowledge.sizes.push_back(dim);
-            }
-          }
-
-          // Compute the new type based on the joined version.
-          auto newKnowledge =
-              ValueKnowledge::join(currentKnowledge, inferredKnowledge);
-          if (!newKnowledge)
-            continue;
-
-          // Set new type
-          result.setType(newKnowledge.getType());
-
-          // Collect all uses of the operation which require update.
-          for (auto &user : result.getUses()) {
-            if (!isReplaceableUser(user.getOwner()))
-              requiresUpdate.push_back({&user, resultTy});
-          }
-        }
-      }
+      if (auto shapeInterface = dyn_cast<InferTypeOpInterface>(op))
+        propagateShapesInterface(shapeInterface, requiresUpdate);
     }
   }
 
   // For each use whose type changed, cast the value with the new type back to
   // the old type.
   IRRewriter rewriter(region.getContext());
-  for (auto [operand, oldType] : requiresUpdate) {
-    rewriter.setInsertionPoint(operand->getOwner());
-
-    auto oldValue = operand->get();
-
-    auto loc = oldValue.getLoc();
-    auto castOp = rewriter.create<tensor::CastOp>(loc, oldType, oldValue);
-    operand->set(castOp);
-  }
+  requiresUpdate.applyUpdates(rewriter);
 }
 
 /// Pass that performs shape propagation across TOSA operations. This includes
@@ -283,13 +335,21 @@ void propagateShapesInRegion(Region &region) {
 struct TosaInferShapes
     : public tosa::impl::TosaInferShapesBase<TosaInferShapes> {
 public:
+  using Base::Base;
+
   void runOnOperation() override {
     func::FuncOp func = getOperation();
-    propagateShapesInRegion(func.getBody());
+
+    ShapePropagation propagation{aggressiveMode};
+    propagation.propagateShapesInRegion(func.getBody());
   }
 };
 } // namespace
 
 std::unique_ptr<Pass> mlir::tosa::createTosaInferShapesPass() {
   return std::make_unique<TosaInferShapes>();
+}
+
+std::unique_ptr<Pass> mlir::tosa::createTosaInferShapesPass(const TosaInferShapesOptions& options) {
+  return std::make_unique<TosaInferShapes>(options);
 }

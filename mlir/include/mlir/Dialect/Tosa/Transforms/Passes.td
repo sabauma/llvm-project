@@ -39,6 +39,13 @@ def TosaInferShapes : Pass<"tosa-infer-shapes", "func::FuncOp"> {
     This includes legalizing rankless and dynamic shapes towards static.
   }];
 
+  let options = [
+    Option<"aggressiveMode", "aggressive-mode", "bool",
+           /*default=*/"false",
+           "Infer as many types as possible, regarless of if they are"
+           "TOSA operations">,
+  ];
+
   let constructor = "createTosaInferShapesPass()";
   let dependentDialects = [
     "func::FuncDialect",

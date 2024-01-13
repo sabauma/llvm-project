@@ -42,6 +42,8 @@ std::unique_ptr<Pass> createTosaLayerwiseConstantFoldPass();
 std::unique_ptr<Pass> createTosaLayerwiseConstantFoldPass(
     const TosaLayerwiseConstantFoldPassOptions &options);
 std::unique_ptr<Pass> createTosaInferShapesPass();
+std::unique_ptr<Pass> createTosaInferShapesPass(
+    const TosaInferShapesOptions& options);
 std::unique_ptr<Pass> createTosaMakeBroadcastablePass();
 std::unique_ptr<Pass> createTosaTestQuantUtilAPIPass();
 std::unique_ptr<Pass> createTosaOptionalDecompositions();
