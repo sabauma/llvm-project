@@ -24,6 +24,7 @@
 #include "mlir/IR/Matchers.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/IR/TypeUtilities.h"
+#include "mlir/Interfaces/ControlFlowInterfaces.h"
 #include "mlir/Interfaces/InferTypeOpInterface.h"
 #include "mlir/Transforms/InliningUtils.h"
 #include "llvm/ADT/APFloat.h"
@@ -122,6 +123,46 @@ struct TosaDialectBytecodeInterface : public BytecodeDialectInterface {
 
 /// Returns the while loop body.
 SmallVector<Region *> tosa::WhileOp::getLoopRegions() { return {&getBody()}; }
+
+OperandRange tosa::WhileOp::getEntrySuccessorOperands(RegionBranchPoint point) {
+  assert(point == getCond() &&
+         "WhileOp is expected to branch only to the first region");
+  return getOperands();
+}
+
+void tosa::WhileOp::getSuccessorRegions(RegionBranchPoint point,
+                                        SmallVectorImpl<RegionSuccessor> &regions) {
+  // The parent op always branches to the condition region.
+  if (point.isParent()) {
+    regions.emplace_back(&getCond(), getCond().getArguments());
+    return;
+  }
+
+  assert(llvm::is_contained({&getCond(), &getBody()}, point) &&
+         "there are only two regions in a WhileOp");
+  // The body region always branches back to the condition region.
+  if (point == getBody()) {
+    regions.emplace_back(&getCond(), getCond().getArguments());
+    return;
+  }
+
+  // Otherwise this is the cond region, can branch to either the body or the
+  // outputs.
+  regions.emplace_back(getResults());
+  regions.emplace_back(&getBody(), getBody().getArguments());
+}
+
+MutableOperandRange
+tosa::YieldOp::getMutableSuccessorOperands(RegionBranchPoint point) {
+  Region* region = getOperation()->getParentRegion();
+
+  if (auto parent = getOperation()->getParentOfType<tosa::WhileOp>()) {
+    if (region == &parent.getCond())
+      return parent.getInputsMutable();
+  }
+
+  return getInputsMutable();
+}
 
 //===----------------------------------------------------------------------===//
 // Tosa dialect initialization.

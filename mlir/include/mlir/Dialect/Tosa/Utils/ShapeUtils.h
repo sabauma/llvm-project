@@ -31,7 +31,7 @@ namespace tosa {
 ///
 /// This class could also be called "dataflow facts", "lattice value", etc.
 struct ValueKnowledge {
-  ValueKnowledge() = delete;
+  ValueKnowledge() : hasError(false), hasRank(false), dtype(Type()) {};
   ValueKnowledge(bool hasRank, llvm::ArrayRef<int64_t> newSizes, Type dtype)
       : hasError(false), hasRank(hasRank), dtype(dtype) {
     sizes.reserve(newSizes.size());
@@ -86,11 +86,11 @@ struct ValueKnowledge {
     ValueKnowledge result = getPessimisticValueState();
     result.hasError = true;
 
-    if (!lhs || !rhs || lhs.dtype != rhs.dtype)
+    if (!lhs || !rhs || (lhs.dtype != nullptr && rhs.dtype != nullptr && lhs.dtype != rhs.dtype))
       return result;
 
     result.hasError = false;
-    result.dtype = lhs.dtype;
+    result.dtype = lhs.dtype ? lhs.dtype : rhs.dtype;
 
     if (!lhs.hasRank && !rhs.hasRank)
       return result;
@@ -163,6 +163,30 @@ struct ValueKnowledge {
     }
 
     return result;
+  }
+
+  /// Print the integer value range.
+  void print(raw_ostream &os) const {
+    if (hasError) {
+      os << "error";
+      return;
+    }
+
+    if (hasRank) {
+      llvm::interleave(
+        sizes,
+        [&](int64_t x) { if (ShapedType::isDynamic(x)) os << "?"; else os << x; },
+        [&]() { os << "x";});
+    } else {
+      os << "*";
+    }
+
+    os << "x";
+
+    if (dtype)
+      dtype.print(os);
+    else
+      os << "?";
   }
 
   // Whether the value information has an error.

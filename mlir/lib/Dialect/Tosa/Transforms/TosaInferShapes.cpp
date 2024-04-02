@@ -11,6 +11,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "mlir/Analysis/DataFlow/DeadCodeAnalysis.h"
 #include "mlir/Dialect/Tosa/Transforms/Passes.h"
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -26,6 +27,154 @@
 #include "mlir/Transforms/DialectConversion.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "llvm/Support/FormatVariadic.h"
+
+#include "mlir/Analysis/DataFlowFramework.h"
+#include "mlir/Analysis/DataFlow/SparseAnalysis.h"
+
+namespace mlir::dataflow {
+
+tosa::ValueKnowledge getValueKnowledge(const ShapedTypeComponents& components) {
+  // Compute the knowledge based on the inferred type.
+  auto inferredKnowledge = tosa::ValueKnowledge::getPessimisticValueState();
+  inferredKnowledge.dtype = components.getElementType();
+  inferredKnowledge.hasRank = components.hasRank();
+  if (components.hasRank()) {
+    for (auto dim : components.getDims()) {
+      inferredKnowledge.sizes.push_back(dim);
+    }
+  }
+
+  return inferredKnowledge;
+}
+
+tosa::ValueKnowledge getValueKnowledge(Value value) {
+  return tosa::ValueKnowledge::getKnowledgeFromType(value.getType());
+}
+
+class ValueKnowledgeLattice : public Lattice<tosa::ValueKnowledge> {
+public:
+  using Lattice::Lattice;
+};
+
+class TensorShapeAnalysis : public SparseForwardDataFlowAnalysis<ValueKnowledgeLattice> {
+public:
+  using SparseForwardDataFlowAnalysis::SparseForwardDataFlowAnalysis;
+
+  /// At an entry point, we cannot reason about interger value ranges.
+  void setToEntryState(ValueKnowledgeLattice *lattice) override {
+    propagateIfChanged(lattice, lattice->join(
+      tosa::ValueKnowledge::getPessimisticValueState()));
+  }
+
+  /// Visit an operation. Invoke the transfer function on each operation that
+  /// implements `InferIntRangeInterface`.
+  void visitOperation(Operation *op,
+                      ArrayRef<const ValueKnowledgeLattice *> operands,
+                      ArrayRef<ValueKnowledgeLattice *> results) override;
+
+  /// Visit block arguments or operation results of an operation with region
+  /// control-flow for which values are not defined by region control-flow. This
+  /// function calls `InferIntRangeInterface` to provide values for block
+  /// arguments or tries to reduce the range on loop induction variables with
+  /// known bounds.
+  void
+  visitNonControlFlowArguments(Operation *op, const RegionSuccessor &successor,
+                               ArrayRef<ValueKnowledgeLattice *> argLattices,
+                               unsigned firstIndex) override;
+protected:
+
+  // Lattice elements are at least as precise as the information in their types.
+  ValueKnowledgeLattice* getLatticeElement(Value v) override {
+    ValueKnowledgeLattice* element = getOrCreate<ValueKnowledgeLattice>(v);
+    propagateIfChanged(
+      element, element->join(tosa::ValueKnowledge::getKnowledgeFromType(v.getType())));
+    return element;
+  }
+};
+
+struct ValueKnowledgeRange {
+public:
+  ValueKnowledgeRange(ValueRange values,
+                      ArrayRef<const ValueKnowledgeLattice*> elements)
+    : values(values) {
+    componentMap.reserve(values.size());
+
+    for (auto [value, element] : llvm::zip(values, elements))
+      componentMap[value] = element->getValue().getShapedTypeComponents();
+
+    mappingFn = [this](Value v) {
+      auto it = componentMap.find(v);
+      assert(it != componentMap.end());
+      return ShapeAdaptor(it->getSecond());
+    };
+  }
+
+  ValueShapeRange getValueShapeRange() {
+    ValueShapeRange range{values};
+    range.setValueToShapeMapping(mappingFn);
+    range.setOperandShapeMapping(mappingFn);
+    return range;
+  }
+
+private:
+  // The base value range.
+  ValueRange values;
+  // Mapping from values to ShapedTypeComponents. Needed to ensure the lifetime
+  // is sufficiently long for use with ShapeAdaptor.
+  llvm::SmallDenseMap<Value, ShapedTypeComponents> componentMap;
+  // Mapping function for ValueShapeRange.
+  std::function<ShapeAdaptor(Value)> mappingFn;
+};
+
+void TensorShapeAnalysis::visitOperation(Operation* op,
+                                         ArrayRef<const ValueKnowledgeLattice*> operands,
+                                         ArrayRef<ValueKnowledgeLattice*> results) {
+  llvm::outs() << "visiting regular op: " << op->getName() << "\n";
+
+  auto shapeInterface = dyn_cast<InferShapedTypeOpInterface>(op);
+
+  auto joinTypeKnowledge = [&](const auto& source, ValueKnowledgeLattice* element) {
+    propagateIfChanged(element, element->join(getValueKnowledge(source)));
+  };
+
+  ValueKnowledgeRange knowledgeRange{op->getOperands(), operands};
+  auto operandRange = knowledgeRange.getValueShapeRange();
+
+  llvm::SmallVector<ShapedTypeComponents> returnedShapes;
+  if (!shapeInterface ||
+      shapeInterface
+          .inferReturnTypeComponents(
+              op->getContext(), op->getLoc(), operandRange,
+              op->getDiscardableAttrDictionary(), op->getPropertiesStorage(),
+              op->getRegions(), returnedShapes)
+          .failed()) {
+    // Join type knowledge pessimistically based on the type of each value.
+    for (auto [result, element] : llvm::zip(op->getResults(), results))
+      joinTypeKnowledge(result, element);
+
+    return;
+  }
+
+  // Join type knowledge using the shapes inferred by the inference interface.
+  for (auto [result, element] : llvm::zip(returnedShapes, results))
+    joinTypeKnowledge(result, element);
+}
+
+void TensorShapeAnalysis::visitNonControlFlowArguments(
+  Operation *op, const RegionSuccessor &successor,
+  ArrayRef<ValueKnowledgeLattice *> argLattices, unsigned firstIndex) {
+
+  llvm::outs() << "visiting non-control flow: " << op->getName() << " @ " << successor.isParent() << ": [";
+  llvm::interleave(argLattices, [](ValueKnowledgeLattice* v) { v->getPoint(); }, []() { llvm::outs() << ", "; });
+  llvm::outs() << "]\n";
+
+  for (auto [operand, argLattice] : llvm::zip(op->getOperands(), argLattices)) {
+    auto& operandLattice = getLatticeElement(operand)->getValue();
+    propagateIfChanged(argLattice, argLattice->join(operandLattice));
+  }
+}
+
+} // namespace mlir::dataflow
 
 namespace mlir {
 namespace tosa {
@@ -285,6 +434,32 @@ struct TosaInferShapes
 public:
   void runOnOperation() override {
     func::FuncOp func = getOperation();
+
+    DataFlowSolver solver;
+    solver.load<dataflow::TensorShapeAnalysis>();
+    solver.load<dataflow::DeadCodeAnalysis>();
+    if (failed(solver.initializeAndRun(func->getParentOp()))) {
+      llvm::outs() << "failed to run solver\n";
+      signalPassFailure();
+    }
+
+    llvm::outs() << "\n\nAnalysis Results:\n";
+    func.walk([&](Operation* op) {
+      llvm::outs() << op->getName() << " = [";
+      auto values = llvm::map_range(op->getResults(), [&](Value v) {
+        const dataflow::ValueKnowledgeLattice* element =
+          solver.lookupState<dataflow::ValueKnowledgeLattice>(v);
+
+        if (!element)
+          return ValueKnowledge::getPessimisticValueState();
+        return element->getValue();
+      });
+
+      llvm::interleave(values, [&](const ValueKnowledge& v) { v.print(llvm::outs()); }, [&]() { llvm::outs() << ", "; });
+      llvm::outs() << "]\n";
+    });
+
+    llvm::outs().flush();
     propagateShapesInRegion(func.getBody());
   }
 };

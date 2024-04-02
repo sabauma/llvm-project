@@ -15,6 +15,7 @@ add_mlir_dialect_library(MLIRTosaDialect
   MLIRShardingInterfaceIncGen
 
   LINK_LIBS PUBLIC
+  MLIRAnalysis
   MLIRIR
   MLIRDialect
   MLIRCallInterfaces

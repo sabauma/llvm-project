@@ -17,6 +17,7 @@
 
 include "mlir/IR/OpBase.td"
 
+include "mlir/Interfaces/ControlFlowInterfaces.td"
 include "mlir/Interfaces/SideEffectInterfaces.td"
 include "mlir/Interfaces/LoopLikeInterface.td"
 include "mlir/Interfaces/VectorInterfaces.td"
@@ -63,7 +64,10 @@ def Tosa_ApplyScaleOp :
 //===----------------------------------------------------------------------===//
 def Tosa_YieldOp : Tosa_Op<"yield", [
        Terminator,
-       Pure]> {
+       Pure,
+       ReturnLike,
+       DeclareOpInterfaceMethods<RegionBranchTerminatorOpInterface, ["getMutableSuccessor"]>
+  ]> {
   let summary = "yield operator";
 
   let description = [{
