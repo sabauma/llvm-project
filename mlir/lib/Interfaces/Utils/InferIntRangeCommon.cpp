@@ -36,6 +36,22 @@ using namespace mlir;
 using ConstArithFn =
     function_ref<std::optional<APInt>(const APInt &, const APInt &)>;
 
+std::function<OptionalIntRanges(llvm::ArrayRef<OptionalIntRanges>)>
+mlir::intrange::inferFromOptionals(intrange::InferRangeFn inferFn) {
+  return [inferFn](llvm::ArrayRef<OptionalIntRanges> args) -> OptionalIntRanges {
+    llvm::SmallVector<ConstantIntRanges> unpacked;
+    unpacked.reserve(args.size());
+
+    for (const OptionalIntRanges &arg : args) {
+      if (!arg)
+        return std::nullopt;
+      unpacked.push_back(*arg);
+    }
+
+    return inferFn(unpacked);
+  };
+}
+
 /// Compute op(minLeft, minRight) and op(maxLeft, maxRight) if possible,
 /// If either computation overflows, make the result unbounded.
 static ConstantIntRanges computeBoundsBy(ConstArithFn op, const APInt &minLeft,
