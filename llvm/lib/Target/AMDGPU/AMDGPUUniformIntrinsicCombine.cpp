@@ -124,7 +124,7 @@ static bool runUniformIntrinsicCombine(Function &F, const UniformityInfo &UI) {
 
     switch (II->getIntrinsicID()) {
     // case Intrinsic::amdgcn_permlane64:
-    case Intrinsic::amdgcn_readfirstlane:
+    // case Intrinsic::amdgcn_readfirstlane:
     case Intrinsic::amdgcn_readlane:
     case Intrinsic::amdgcn_ballot:
       break;
