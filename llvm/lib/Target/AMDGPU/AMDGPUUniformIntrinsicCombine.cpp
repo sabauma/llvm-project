@@ -66,6 +66,7 @@ static bool optimizeUniformIntrinsic(IntrinsicInst &II,
     if (isDivergentUseWithNew(II.getOperandUse(0), UI, Tracker))
       return false;
     LLVM_DEBUG(dbgs() << "Replacing " << II << " with " << *Src << '\n');
+    llvm::errs() << "Replacing " << II << " with " << *Src << '\n';
     II.replaceAllUsesWith(Src);
     II.eraseFromParent();
     return true;
@@ -137,10 +138,6 @@ static bool runUniformIntrinsicCombine(Function &F, const UniformityInfo &UI) {
     }
     IsChanged |= optimizeUniformIntrinsic(*II, UI, Tracker);
   }
-
-  llvm::errs() << "// ----- After ----- //\n";
-  llvm::errs() << F << "\n";
-  llvm::errs() << "// ----- After ----- //\n";
 
   return IsChanged;
 }
