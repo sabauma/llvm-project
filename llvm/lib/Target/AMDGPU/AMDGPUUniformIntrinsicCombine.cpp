@@ -118,6 +118,9 @@ static bool runUniformIntrinsicCombine(Function &F, const UniformityInfo &UI) {
   bool IsChanged = false;
   ValueMap<const Value *, bool> Tracker;
 
+  static std::mutex Lock;
+  std::lock_guard<std::mutex> Guard(Lock);
+
   llvm::errs() << "// ----- Before ----- //\n";
   llvm::errs() << F << "\n";
   llvm::errs() << "// ----- Before ----- //\n";
@@ -137,6 +140,12 @@ static bool runUniformIntrinsicCombine(Function &F, const UniformityInfo &UI) {
       continue;
     }
     IsChanged |= optimizeUniformIntrinsic(*II, UI, Tracker);
+  }
+
+  if (IsChanged) {
+    llvm::errs() << "// ----- After ----- //\n";
+    llvm::errs() << F << "\n";
+    llvm::errs() << "// ----- After ----- //\n";
   }
 
   return IsChanged;
