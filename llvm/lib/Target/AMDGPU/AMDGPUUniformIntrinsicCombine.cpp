@@ -117,6 +117,10 @@ static bool runUniformIntrinsicCombine(Function &F, const UniformityInfo &UI) {
   bool IsChanged = false;
   ValueMap<const Value *, bool> Tracker;
 
+  llvm::errs() << "// ----- Before ----- //\n";
+  llvm::errs() << F << "\n";
+  llvm::errs() << "// ----- Before ----- //\n";
+
   for (Instruction &I : make_early_inc_range(instructions(F))) {
     auto *II = dyn_cast<IntrinsicInst>(&I);
     if (!II)
@@ -133,6 +137,11 @@ static bool runUniformIntrinsicCombine(Function &F, const UniformityInfo &UI) {
     }
     IsChanged |= optimizeUniformIntrinsic(*II, UI, Tracker);
   }
+
+  llvm::errs() << "// ----- After ----- //\n";
+  llvm::errs() << F << "\n";
+  llvm::errs() << "// ----- After ----- //\n";
+
   return IsChanged;
 }
 
